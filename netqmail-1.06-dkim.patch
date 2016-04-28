@@ -1,0 +1,797 @@
+--- netqmail-1.06.org/Makefile	2007-12-01 05:22:54.000000000 +0900
++++ netqmail-1.06/Makefile	2016-04-27 17:07:39.883803513 +0900
+@@ -1441,12 +1441,12 @@
+ load qmail-remote.o control.o constmap.o timeoutread.o timeoutwrite.o \
+ timeoutconn.o tcpto.o now.o dns.o ip.o ipalloc.o ipme.o quote.o \
+ ndelay.a case.a sig.a open.a lock.a seek.a getln.a stralloc.a alloc.a \
+-substdio.a error.a str.a fs.a auto_qmail.o dns.lib socket.lib
++substdio.a error.a str.a fs.a auto_qmail.o dns.lib socket.lib env.a
+ 	./load qmail-remote control.o constmap.o timeoutread.o \
+ 	timeoutwrite.o timeoutconn.o tcpto.o now.o dns.o ip.o \
+ 	ipalloc.o ipme.o quote.o ndelay.a case.a sig.a open.a \
+ 	lock.a seek.a getln.a stralloc.a alloc.a substdio.a error.a \
+-	str.a fs.a auto_qmail.o  `cat dns.lib` `cat socket.lib`
++	str.a fs.a auto_qmail.o  `cat dns.lib` `cat socket.lib` -lssl -lcrypto env.a -ldkim -ldomainkeys
+ 
+ qmail-remote.0: \
+ qmail-remote.8
+@@ -1457,7 +1457,8 @@
+ subfd.h substdio.h scan.h case.h error.h auto_qmail.h control.h dns.h \
+ alloc.h quote.h ip.h ipalloc.h ip.h gen_alloc.h ipme.h ip.h ipalloc.h \
+ gen_alloc.h gen_allocdefs.h str.h now.h datetime.h exit.h constmap.h \
+-tcpto.h readwrite.h timeoutconn.h timeoutread.h timeoutwrite.h
++tcpto.h readwrite.h timeoutconn.h timeoutread.h timeoutwrite.h \
++env.h
+ 	./compile qmail-remote.c
+ 
+ qmail-rspawn: \
+@@ -1541,8 +1542,8 @@
+ 	timeoutwrite.o ip.o ipme.o ipalloc.o control.o constmap.o \
+ 	received.o date822fmt.o now.o qmail.o cdb.a fd.a wait.a \
+ 	datetime.a getln.a open.a sig.a case.a env.a stralloc.a \
+-	alloc.a substdio.a error.a str.a fs.a auto_qmail.o  `cat \
+-	socket.lib`
++	alloc.a substdio.a error.a str.a fs.a auto_qmail.o `cat dns.lib` `cat \
++	socket.lib` -lssl -lcrypto -lcrypt -ldkim -ldomainkeys
+ 
+ qmail-smtpd.0: \
+ qmail-smtpd.8
+@@ -1814,7 +1815,7 @@
+ sig_pipe.c sig_child.c sig_term.c sig_hup.c sig_misc.c sig_bug.c \
+ trysgact.c trysgprm.c env.3 env.h env.c envread.c byte.h byte_chr.c \
+ byte_copy.c byte_cr.c byte_diff.c byte_rchr.c byte_zero.c str.h \
+-str_chr.c str_cpy.c str_diff.c str_diffn.c str_len.c str_rchr.c \
++str_chr.c str_cpy.c str_cpyb.c str_diff.c str_diffn.c str_len.c str_rchr.c \
+ str_start.c lock.h lock_ex.c lock_exnb.c lock_un.c tryflock.c getln.3 \
+ getln.h getln.c getln2.3 getln2.c sgetopt.3 sgetopt.h sgetopt.c \
+ subgetopt.3 subgetopt.h subgetopt.c error.3 error_str.3 error_temp.3 \
+@@ -1912,10 +1913,10 @@
+ 	./compile splogger.c
+ 
+ str.a: \
+-makelib str_len.o str_diff.o str_diffn.o str_cpy.o str_chr.o \
++makelib str_len.o str_diff.o str_diffn.o str_cpy.o str_cpyb.o str_chr.o \
+ str_rchr.o str_start.o byte_chr.o byte_rchr.o byte_diff.o byte_copy.o \
+ byte_cr.o byte_zero.o
+-	./makelib str.a str_len.o str_diff.o str_diffn.o str_cpy.o \
++	./makelib str.a str_len.o str_diff.o str_diffn.o str_cpy.o str_cpyb.o \
+ 	str_chr.o str_rchr.o str_start.o byte_chr.o byte_rchr.o \
+ 	byte_diff.o byte_copy.o byte_cr.o byte_zero.o
+ 
+@@ -1927,6 +1928,10 @@
+ compile str_cpy.c str.h
+ 	./compile str_cpy.c
+ 
++str_cpyb.o: \
++compile str_cpyb.c str.h
++	./compile str_cpyb.c
++
+ str_diff.o: \
+ compile str_diff.c str.h
+ 	./compile str_diff.c
+--- netqmail-1.06.org/qmail-remote.8	1998-06-15 19:53:16.000000000 +0900
++++ netqmail-1.06/qmail-remote.8	2016-04-27 16:14:24.534188094 +0900
+@@ -114,6 +114,17 @@
+ always exits zero.
+ .SH "CONTROL FILES"
+ .TP 5
++.I dksign
++Path to the private key file(s) to use for performing DKIM and DomainKey
++signing.  If there is a % character in the environment variable, it is removed
++and replaced by the domain name in the From: header, or the Sender: header if
++it exists.  If, after substituting the %, that file does not exist, each parent
++domain in the From/Sender headers will be tried.  If no domains match,
++the message will not be signed.  If there is no % and the file does not exist,
++the message will not be sent and will remain in the queue.  The selector will
++be taken from the basename of the file.  The private key should be created by
++dknewkey, which comes with libdomainkey.
++.TP 5
+ .I helohost
+ Current host name,
+ for use solely in saying hello to the remote SMTP server.
+--- netqmail-1.06.org/qmail-remote.c	1998-06-15 19:53:16.000000000 +0900
++++ netqmail-1.06/qmail-remote.c	2016-04-27 16:36:13.360026599 +0900
+@@ -28,6 +28,11 @@
+ #include "timeoutconn.h"
+ #include "timeoutread.h"
+ #include "timeoutwrite.h"
++#ifdef DKIM
++#include "env.h"
++#include "dkim.h"
++#include "domainkeys.h"
++#endif
+ 
+ #define HUGESMTPTEXT 5000
+ 
+@@ -70,6 +75,21 @@
+ Unable to switch to home directory. (#4.3.0)\n"); zerodie(); }
+ void temp_control() { out("Z\
+ Unable to read control files. (#4.3.0)\n"); zerodie(); }
++#ifdef DKIM
++void temp_read_dkkey() { out("Z\
++Unable to read dkim key. (#4.3.0)\n"); zerodie(); }
++void temp_find_dkkey() { out("Z\
++Unable to find dkim key. (#4.3.0)\n"); zerodie(); }
++void temp_bad_dkkey() { out("Z\
++Bad dkim key. (#4.3.0)\n"); zerodie(); }
++void temp_internal_bug() { out("Z\
++Internal bug (#4.3.0)\n"); zerodie(); }
++void temp_cant_verify() { out("Z\
++Can't verify dk (#4.3.0)\n"); zerodie(); }
++void temp_write() { out("ZUnable to write temp file (#4.3.0)\n"); zerodie(); }
++void perm_dk_err() { out("D\
++Unknown dk error (#5.3.5)\n"); zerodie(); }
++#endif
+ void perm_partialline() { out("D\
+ SMTP cannot transfer messages with partial final lines. (#5.6.2)\n"); zerodie(); }
+ void perm_usage() { out("D\
+@@ -86,6 +106,77 @@
+ it isn't in my control/locals file, so I don't treat it as local. (#5.4.6)\n");
+ zerodie(); }
+ 
++#ifdef DKIM
++#define DKLINELEN 64
++stralloc dksign = {0};
++char *pidfn;
++int tempfdr;
++int tempfdw;
++char tempbuf[512];
++
++void maybe_die_dk(e) DK_STAT e; {
++  switch(e) {
++  case DK_STAT_BADKEY: temp_bad_dkkey();
++  case DK_STAT_CANTVRFY: temp_cant_verify();
++  case DK_STAT_NORESOURCE: temp_nomem();
++  case DK_STAT_ARGS: perm_dk_err();
++  case DK_STAT_INTERNAL: temp_internal_bug();
++  }
++}
++void maybe_die_dkim(e) int DKIM_CALL e; {
++  switch(e) {
++  case DKIM_OUT_OF_MEMORY: temp_nomem();
++  case DKIM_INVALID_CONTEXT: perm_dk_err();
++  case DKIM_NO_SENDER: perm_dk_err();
++  case DKIM_BAD_PRIVATE_KEY: temp_bad_dkkey();
++  case DKIM_BUFFER_TOO_SMALL: temp_nomem();
++  }
++}
++
++unsigned int pidfmt(s,seq)
++char *s;
++unsigned long seq;
++{
++ unsigned int i;
++ unsigned int len;
++ unsigned long mypid;
++ datetime_sec starttime;
++
++ starttime = now();
++ len = 0;
++ i = fmt_str(s,"/tmp/qmail-remote."); len += i; if (s) s += i;
++ i = fmt_ulong(s,mypid); len += i; if (s) s += i;
++ i = fmt_str(s,"."); len += i; if (s) s += i;
++ i = fmt_ulong(s,starttime); len += i; if (s) s += i;
++ i = fmt_str(s,"."); len += i; if (s) s += i;
++ i = fmt_ulong(s,seq); len += i; if (s) s += i;
++ ++len; if (s) *s++ = 0;
++
++ return len;
++}
++
++void pidopen()
++{
++ unsigned int len;
++ unsigned long seq;
++
++ seq = 1;
++ len = pidfmt((char *) 0,seq);
++ pidfn = alloc(len);
++ if (!pidfn) temp_nomem();
++
++ for (seq = 1;seq < 10;++seq)
++  {
++   if (pidfmt((char *) 0,seq) > len) temp_internal_bug(); /* paranoia */
++   pidfmt(pidfn,seq);
++   tempfdw  = open_excl(pidfn);
++   if (tempfdw != -1) return;
++  }
++
++ temp_oserr();
++}
++#endif
++
+ void outhost()
+ {
+   char x[IPFMT];
+@@ -214,6 +305,193 @@
+   substdio_flush(&smtpto);
+ }
+ 
++#ifdef DKIM
++void blastdk()
++{
++  char *from;
++  char *selector;
++  char *sigptr;
++  int i;
++  int linelen;
++  time_t t;
++  char advice[2048];
++  char szSignature[10024];
++  stralloc dksig = {0};
++  stralloc dkkeyfile = {0};
++  stralloc dksignature = {0};
++  substdio tempio;
++  DK_LIB *dklib;
++  DKIMContext dkim;
++  DK *dk;
++  int DKIM_CALL dkimst;
++  DKIMSignOptions dkimSOptions = {0};
++  DK_STAT dkst;
++  
++  dklib = dk_init(0);
++  if (!dklib) temp_nomem();
++  dk = dk_sign(dklib, &dkst, DK_CANON_NOFWS);
++  if (!dk) perm_dk_err();
++
++  pidopen();
++  tempfdr = open_read(pidfn);
++  if (unlink(pidfn)==-1) temp_oserr();
++  
++  substdio_fdbuf(&tempio,write,tempfdw,tempbuf,sizeof(tempbuf));
++  for (;;) {
++    register int n;
++    register char *x;
++
++    n = substdio_feed(&ssin);
++    if (n < 0) temp_read();
++    if (!n) break;
++    x = substdio_PEEK(&ssin);
++    for(i=0; i<n; i++) {
++      if (x[i] == '\n') dkst = dk_message(dk, "\r\n", 2);
++      else dkst = dk_message(dk, x+i, 1);
++      maybe_die_dk(dkst);
++    }
++    if (substdio_put(&tempio,x,n) == -1) temp_write();
++    substdio_SEEK(&ssin,n);
++  }
++  if (substdio_flush(&tempio) == -1) temp_write();
++  substdio_fdbuf(&ssin,read,tempfdr,inbuf,sizeof(inbuf));
++  close(tempfdw);
++
++
++  dkst = dk_eom(dk, (void *)0);
++  maybe_die_dk(dkst);
++
++  from = dk_address(dk);
++  if(from && from[0] != 'N' && from[str_chr(from,'@')] && from[str_chr(from,'@')+1]) {
++    char *keyfn;
++    from += str_chr(from,'@')+1;
++
++    i = str_chr(dksign.s, '%');
++    if (dksign.s[i]) {
++      int fd;
++      // Find first matching parent domain per RFC 4871
++      for (;;) {
++        if (!stralloc_copyb(&dkkeyfile,dksign.s,i)) temp_nomem();
++        if (!stralloc_cats(&dkkeyfile,from)) temp_nomem();
++        if (!stralloc_cats(&dkkeyfile,dksign.s + i + 1)) temp_nomem();
++        if (!stralloc_0(&dkkeyfile)) temp_nomem();
++        fd = open_read(dkkeyfile.s);
++        if (fd != -1) { close(fd); break; }
++        if (errno != error_noent) break;
++        if (from[str_chr(from, '.')] && from[str_chr(from, '.')+1]) {
++          from += str_chr(from, '.') + 1;
++        } else {
++          blast(); return;
++        }
++      }
++    } else {
++      if (!stralloc_copys(&dkkeyfile,dksign.s)) temp_nomem();
++      if (!stralloc_0(&dkkeyfile)) temp_nomem();
++    }
++    switch(control_readfile(&dksignature,dkkeyfile.s,0)) {
++      case 0:
++        if(dksign.s[i]) { blast(); return; }
++        temp_find_dkkey();
++      case 1:
++        for(i=0; i<dksignature.len; i++)
++          if (dksignature.s[i] == '\0') dksignature.s[i] = '\n';
++        if(!stralloc_0(&dksignature)) temp_nomem();
++        break;
++      default: temp_read_dkkey();
++    }
++    selector = dkkeyfile.s;
++    keyfn = dkkeyfile.s;
++    while (*keyfn) {
++      if (*keyfn == '/') selector = keyfn+1;
++      keyfn++;
++    }
++  } else {
++    from = 0;
++  }
++
++  if (from && selector) {
++    if(!stralloc_copys(&dksig,
++        "Comment: DomainKeys? See http://antispam.yahoo.com/domainkeys\r\n"
++        "DomainKey-Signature: a=rsa-sha1; q=dns; c=nofws;\r\n"
++        "\ts=")) temp_nomem();
++    if(!stralloc_cats(&dksig, selector)) temp_nomem();
++    if(!stralloc_cats(&dksig, "; d=")) temp_nomem();
++    if(!stralloc_cats(&dksig, from)) temp_nomem();
++    if (dk_headers(dk, NULL) && dk_headers(dk, NULL) < sizeof(advice)) {
++      dk_headers(dk, advice);
++      if(!stralloc_cats(&dksig, ";\r\n\th=")) temp_nomem();
++      if(!stralloc_cats(&dksig, advice)) temp_nomem();
++    }
++    dkst = dk_getsig(dk, dksignature.s, advice, sizeof(advice));
++    maybe_die_dk(dkst);
++    if(!stralloc_cats(&dksig,";\r\n\tb=")) temp_nomem();
++    sigptr = advice; linelen=2;
++    for(;;) {
++      if(str_len(sigptr) > DKLINELEN-linelen) {
++        if(!stralloc_catb(&dksig,sigptr,DKLINELEN-linelen)) temp_nomem();
++        if(!stralloc_cats(&dksig,"\r\n\t")) temp_nomem();
++        sigptr += DKLINELEN-linelen; linelen=0;
++      } else {
++        if(!stralloc_cats(&dksig,sigptr)) temp_nomem();
++        break;
++      }
++    }
++    if(!stralloc_cats(&dksig,";\r\n")) temp_nomem();
++
++
++
++    time(&t);
++    dkimSOptions.nHash = DKIM_HASH_SHA256;
++    dkimSOptions.nHash = DKIM_HASH_SHA256;
++    dkimSOptions.nCanon = DKIM_SIGN_RELAXED;
++    dkimSOptions.nIncludeBodyLengthTag = 0;
++    dkimSOptions.nIncludeQueryMethod = 0;
++    dkimSOptions.nIncludeTimeStamp = 0;
++    dkimSOptions.expireTime = t + 604800;
++    str_copy( dkimSOptions.szRequiredHeaders, "NonExistant" );
++    dkimSOptions.nIncludeCopiedHeaders = 0;
++    dkimSOptions.nIncludeBodyHash = DKIM_BODYHASH_IETF_1;
++    str_copyb( dkimSOptions.szSelector, selector, sizeof(dkimSOptions.szSelector) );
++    str_copyb( dkimSOptions.szDomain, from, sizeof(dkimSOptions.szDomain) );
++
++    dkimst = DKIMSignInit(&dkim, &dkimSOptions);
++    maybe_die_dkim(dkimst);
++    DKIMSignProcess(&dkim, dksig.s, dksig.len);
++
++    substdio_fdbuf(&tempio,read,tempfdr,tempbuf,sizeof(tempbuf));
++    for (;;) {
++      register int n;
++      register char *x;
++
++      n = substdio_feed(&tempio);
++      if (n < 0) temp_read();
++      if (!n) break;
++      x = substdio_PEEK(&tempio);
++      for(i=0; i<n; i++) {
++        if (x[i] == '\n') DKIMSignProcess(&dkim, "\r\n", 2);
++        else DKIMSignProcess(&dkim, x+i, 1);
++      }
++      substdio_SEEK(&tempio,n);
++    }
++    lseek(tempfdr, 0, SEEK_SET);
++
++    dkimst = DKIMSignGetSig( &dkim, dksignature.s, szSignature, sizeof(szSignature) );
++    maybe_die_dkim(dkimst);
++    DKIMSignFree( &dkim );
++
++    substdio_puts(&smtpto,
++      "Comment: DKIM? See http://www.dkim.org\r\n");
++    substdio_puts(&smtpto, szSignature);
++    substdio_puts(&smtpto, "\r\n");
++
++    substdio_put(&smtpto, dksig.s, dksig.len);
++  }
++
++  blast();
++
++}
++#endif
++
+ stralloc recip = {0};
+ 
+ void smtp()
+@@ -264,6 +542,12 @@
+   code = smtpcode();
+   if (code >= 500) quit("D"," failed on DATA command");
+   if (code >= 400) quit("Z"," failed on DATA command");
++
++#ifdef DKIM
++  if (dksign.s)
++     blastdk();
++  else
++#endif
+  
+   blast();
+   code = smtpcode();
+@@ -324,6 +608,11 @@
+     case 1:
+       if (!constmap_init(&maproutes,routes.s,routes.len,1)) temp_nomem(); break;
+   }
++#ifdef DKIM
++  if (control_readline(&dksign,"control/dksign") < 0)
++    temp_control();
++  if(dksign.s) stralloc_0(&dksign);
++#endif
+ }
+ 
+ void main(argc,argv)
+--- netqmail-1.06.org/qmail-smtpd.8	1998-06-15 19:53:16.000000000 +0900
++++ netqmail-1.06/qmail-smtpd.8	2016-04-27 16:22:32.898105477 +0900
+@@ -152,6 +152,37 @@
+ Envelope recipient addresses without @ signs are
+ always allowed through.
+ .TP 5
++.I DKVERIFY
++Setting this variable will cause the message to be checked for DKIM and
++DomainKeys signatures.  The variable can be set to a desired set of letters
++for DomainKeys and DKIM.  Precisely, if you want a libdomainkey return status
++to generate an error, include the letter, where A is the first return status
++(DK_STAT_OK), B is the second (DK_STAT_BADSIG), etc.  Similarly if you want a
++libdkim return status to generate an error, include that letter, where A is the
++first return status (DKIM_SUCCESS), B is the second (DKIM_FAIL), C is the third
++(DKIM_BAD_SYNTAX), etc.  The letter should be uppercase if you want a permanent
++error to be returned, and lowercase if you want a temporary error to be
++returned.  The letter sets for libdomainkey and libdkim return codes should be
++separated by a comma.
++For example, if you want to permanently reject messages that have a DomainKey
++signature that has been revoked, include the letter 'J' in the
++.B DKVERIFY
++environment variable before the comma.  To reject messages that have a DKIM
++signature that has been revoked, include the letter 'I' in the DKVERIFY
++environment variable after the comma
++A conservative set of letters is 
++.BR DEGIJKfh,CGHIJMQRkl .
++Reject permanently DomainKey NOKEY, BADKEY, SYNTAX, ARGS, REVOKED, and INTERNAL
++errors, and DKIM BAD_SYNTAX, SELECTOR_INVALID, SELECTOR_GRANULARITY_MISMATCH,
++KEY_REVOKED, DOMAIN_TOO_LONG, KEY_INVALID, SELECTOR_ALGORITHM_MISMATCH, and
++STAT_INCOMPAT errors.  Reject temporarily DomainKey CANTVRFY and NORESOURCE and
++DKIM DNS_TEMP_FAILURE and DNS_PERM_FAILURE.  Add in B (BADSIG) before the comma
++and DEFP (BAD, BAD_BUT_TESTING, EXPIRED, BODY_HASH_MISMATCH) after the comma if
++you want to reject messages that have a signature that doesn't verify
++(presumably because the message is a forgery or has been damaged in transit.
++Note that qmail-smtpd always inserts the Authentication-Results header so that
++messages can be rejected at delivery time, or in the mail reader.
++.TP 5
+ .I smtpgreeting
+ SMTP greeting message.
+ Default:
+--- netqmail-1.06.org/qmail-smtpd.c	2007-12-01 05:22:54.000000000 +0900
++++ netqmail-1.06/qmail-smtpd.c	2016-04-27 16:53:06.091805614 +0900
+@@ -20,13 +20,33 @@
+ #include "now.h"
+ #include "exit.h"
+ #include "rcpthosts.h"
++#include "commands.h"
++#include "strerr.h"
++#include "wait.h"
++#include "fd.h"
++#include "dns.h"
++#include "cdb.h"
++#include "auto_break.h"
+ #include "timeoutread.h"
+ #include "timeoutwrite.h"
+-#include "commands.h"
++#ifdef DKIM
++#include "dkim.h"
++#include "domainkeys.h"
++#endif
+ 
+ #define MAXHOPS 100
+ unsigned int databytes = 0;
+ int timeout = 1200;
++#ifdef DKIM
++stralloc dkverify = {0};
++char *dkimverify = 0;
++char *hostname;
++int put_dktemp = 0;
++char *pidfn;
++DK *dk;
++DK_STAT dkst;
++DKIMContext dkim;
++#endif
+ 
+ int safewrite(fd,buf,len) int fd; char *buf; int len;
+ {
+@@ -39,6 +59,13 @@
+ char ssoutbuf[512];
+ substdio ssout = SUBSTDIO_FDBUF(safewrite,1,ssoutbuf,sizeof ssoutbuf);
+ 
++#ifdef DKIM
++char tempbuf[512];
++int tempfdr;
++int tempfdw;
++substdio tempio;
++#endif
++
+ void flush() { substdio_flush(&ssout); }
+ void out(s) char *s; { substdio_puts(&ssout,s); }
+ 
+@@ -60,6 +87,82 @@
+ void err_qqt() { out("451 qqt failure (#4.3.0)\r\n"); }
+ 
+ 
++#ifdef DKIM
++void die_dk_err() { out("451 Unknown dk error (#4.3.0)\r\n"); flush(); _exit(1); }
++void die_oserr() { out("421 System resources temporarily unavailable. (#4.3.0)\r\n"); flush(); _exit(1); }
++void die_bad_dkkey() { out("451 Bad DomainKeys or DKIM key (#4.3.0)\r\n"); flush(); _exit(1); }
++void die_cant_verify() { out("451 Can't verify DomainKeys or DKIM (#4.3.0)\r\n"); flush(); _exit(1); }
++void die_dk_usage() { out("451 oops, problem with Domainkeys or DKIM args (#4.3.0)\r\n"); flush(); _exit(1); }
++void die_temp_write() { out("421 Can't write temp buffer (#4.3.0)\r\n"); flush(); _exit(1); }
++
++void die_dk_reject() { out("554 DomainKeys permanently rejected message (#5.3.0)\r\n"); flush(); _exit(1); }
++void die_dkim_reject() { out("554 DomainKeys Identified Mail (DKIM) permanently rejected message (#5.3.0)\r\n"); flush(); _exit(1); }
++void die_dk_defer() { out("451 DomainKeys temporarily deferred message, please try again later (#4.3.0)\r\n"); flush(); _exit(1); }
++void die_dkim_defer() { out("451 DomainKeys Identified Mail (DKIM) temporarily deferred message, please try again later (#4.3.0)\r\n"); flush(); _exit(1); }
++
++void maybe_die_dk(e) DK_STAT e; {
++  switch(e) {
++  case DK_STAT_BADKEY: die_bad_dkkey();
++  case DK_STAT_CANTVRFY: die_cant_verify();
++  case DK_STAT_NORESOURCE: die_nomem();
++  case DK_STAT_ARGS: die_dk_usage();
++  case DK_STAT_INTERNAL: die_dk_err();
++  }
++}
++void maybe_die_dkim(e) int DKIM_CALL e; {
++  switch(e) {
++  case DKIM_OUT_OF_MEMORY: die_nomem();
++  case DKIM_INVALID_CONTEXT: die_dk_usage();
++  case DKIM_NO_SENDER: die_dk_usage();
++  case DKIM_BAD_PRIVATE_KEY: die_bad_dkkey();
++  case DKIM_BUFFER_TOO_SMALL: die_nomem();
++  }
++}
++
++unsigned int pidfmt(s,seq)
++char *s;
++unsigned long seq;
++{
++ unsigned int i;
++ unsigned int len;
++ unsigned long mypid;
++ datetime_sec starttime;
++
++ starttime = now();
++ len = 0;
++ i = fmt_str(s,"/tmp/qmail-smtpd."); len += i; if (s) s += i;
++ i = fmt_ulong(s,mypid); len += i; if (s) s += i;
++ i = fmt_str(s,"."); len += i; if (s) s += i;
++ i = fmt_ulong(s,starttime); len += i; if (s) s += i;
++ i = fmt_str(s,"."); len += i; if (s) s += i;
++ i = fmt_ulong(s,seq); len += i; if (s) s += i;
++ ++len; if (s) *s++ = 0;
++
++ return len;
++}
++
++void pidopen()
++{
++ unsigned int len;
++ unsigned long seq;
++
++ seq = 1;
++ len = pidfmt((char *) 0,seq);
++ pidfn = alloc(len);
++ if (!pidfn) die_nomem();
++ for (seq = 1;seq < 10;++seq)
++  {
++   if (pidfmt((char *) 0,seq) > len) die_oserr(); /* paranoia */
++   pidfmt(pidfn,seq);
++   tempfdw = open_excl(pidfn);
++   if (tempfdw != -1) return;
++  }
++
++ die_oserr();
++}
++
++#endif
++
+ stralloc greeting = {0};
+ 
+ void smtp_greet(code) char *code;
+@@ -131,6 +234,18 @@
+   if (!remotehost) remotehost = "unknown";
+   remoteinfo = env_get("TCPREMOTEINFO");
+   relayclient = env_get("RELAYCLIENT");
++
++#ifdef DKIM
++  x = env_get("DKVERIFY");
++  if(x) {
++    if(!stralloc_copys(&dkverify, x)) die_nomem();
++    if(dkverify.s[str_chr(dkverify.s, ',')]) {
++      dkimverify = dkverify.s + str_chr(dkverify.s, ',') + 1;
++      dkverify.s[str_chr(dkverify.s, ',')] = '\0';
++    }
++  }
++#endif
++
+   dohelo(remotehost);
+ }
+ 
+@@ -284,10 +399,25 @@
+ void put(ch)
+ char *ch;
+ {
++#ifdef DKIM
++  if(put_dktemp) {
++    if (substdio_put(&tempio,ch,1) == -1) die_temp_write();
++    
++    if (*ch == '\n') DKIMVerifyProcess(&dkim, "\r\n", 2);
++    else DKIMVerifyProcess(&dkim, ch, 1);
++      
++    if (*ch == '\n') dkst = dk_message(dk, "\r\n", 2);
++    else dkst = dk_message(dk, ch, 1);
++    maybe_die_dk(dkst);
++  } else {
++#endif
+   if (bytestooverflow)
+     if (!--bytestooverflow)
+       qmail_fail(&qqt);
+   qmail_put(&qqt,ch,1);
++#ifdef DKIM
++  }
++#endif
+ }
+ 
+ void blast(hops)
+@@ -351,6 +481,119 @@
+   }
+ }
+ 
++#ifdef DKIM
++void blastdk(hops)
++int *hops;
++{
++  int DKIM_CALL dkimst;
++  DKIMVerifyOptions dkimVOptions = {0};
++  DKIMVerifyDetails *dkimVDetails;
++  int dkimVSigCount;
++  char dkimVPolicy[1024]; // See dkimverify.cpp Buffer
++  DK_LIB *dklib;
++  if (dkverify.s && !relayclient) {
++    dklib = dk_init(0);
++    if(!dklib) die_nomem();
++    dk = dk_verify(dklib, &dkst);
++    if (!dk) die_dk_err();
++    dkimVOptions.nCheckPractices=1;
++    dkimst = DKIMVerifyInit(&dkim, &dkimVOptions);
++    maybe_die_dkim(dkimst);
++    pidopen();
++    tempfdr = open_read(pidfn);
++    if(unlink(pidfn) == -1) die_oserr();
++    substdio_fdbuf(&tempio,write,tempfdw,tempbuf,sizeof(tempbuf));
++    put_dktemp = 1;
++  }
++  blast(hops);
++  if (put_dktemp) {
++    int r;
++    char ch;
++    char *dkstatus = 0;
++    char *dkimstatus = 0;
++    char *dkreject = 0;
++    put_dktemp = 0;
++    
++    if (substdio_flush(&tempio) == -1) die_temp_write();
++    close(tempfdw);
++    substdio_fdbuf(&tempio,read,tempfdr,ssinbuf,sizeof(ssinbuf));
++    dkst = dk_eom(dk, (void *)0);
++    maybe_die_dk(dkst);
++    dkimst = DKIMVerifyResults(&dkim);
++    switch(dkst) {
++    case DK_STAT_OK:         dkstatus = "pass (ok)";                  break;
++    case DK_STAT_BADSIG:     dkstatus = "fail (bad sig)";             break;
++    case DK_STAT_NOSIG:      dkstatus = "none (no signature)";        break;
++    case DK_STAT_NOKEY:      dkstatus = "fail (no key)";              break;
++    case DK_STAT_CANTVRFY:   dkstatus = "temperror (can't verify)";   break;
++    case DK_STAT_BADKEY:     dkstatus = "fail (bad key)";             break;
++    case DK_STAT_INTERNAL:   dkstatus = "temperror (internal error)"; break;
++    case DK_STAT_ARGS:       dkstatus = "neutral (args)";             break;
++    case DK_STAT_SYNTAX:     dkstatus = "neutral (bad format)";       break;
++    case DK_STAT_NORESOURCE: dkstatus = "temperror (no resources)";   break;
++    case DK_STAT_REVOKED:    dkstatus = "fail (revoked)";             break;
++    }
++    if(dkimst==DKIM_SUCCESS || dkimst==DKIM_PARTIAL_SUCCESS) {
++      dkimstatus = "pass (ok)";
++    } else {
++      int i;
++      dkimst = DKIMVerifyGetDetails(&dkim, &dkimVSigCount, &dkimVDetails, dkimVPolicy);
++      maybe_die_dkim(dkimst);
++      if (dkimVSigCount == 0) {
++        dkimst = DKIM_NO_SIGNATURES;
++        dkimstatus = "none (no signature)";
++      } else {
++        for(i=0; i<dkimVSigCount; i++) {
++          if(dkimVDetails[i].nResult != DKIM_SUCCESS) {
++            dkimst = dkimVDetails[i].nResult;
++            switch(dkimst) {
++            case DKIM_BAD_SYNTAX:                    dkimstatus = "neutral (bad syntax)";    break;
++            case DKIM_FAIL:                          
++            case DKIM_SIGNATURE_BAD:                 dkimstatus = "fail (bad sig)";          break;
++            case DKIM_SIGNATURE_BAD_BUT_TESTING:     dkimstatus = "fail (bad sig, testing)"; break;
++            case DKIM_SIGNATURE_EXPIRED:             dkimstatus = "fail (expired)";          break;
++            case DKIM_SELECTOR_INVALID:
++            case DKIM_SELECTOR_GRANULARITY_MISMATCH:
++            case DKIM_SELECTOR_KEY_REVOKED:          dkimstatus = "neutral (bad selector)";  break;
++            case DKIM_SELECTOR_DOMAIN_NAME_TOO_LONG: dkimstatus = "neutral (bad domain)";    break;
++            case DKIM_SELECTOR_DNS_TEMP_FAILURE:     dkimstatus = "permerror (dns)";         break;
++            case DKIM_SELECTOR_DNS_PERM_FAILURE:     dkimstatus = "temperror (dns)";         break;
++            case DKIM_SELECTOR_PUBLIC_KEY_INVALID:   dkimstatus = "fail (bad key)";          break;
++            case DKIM_NO_SIGNATURES:                 dkimstatus = "neutral (no signature)";  break;
++            case DKIM_NO_VALID_SIGNATURES:           dkimstatus = "neutral (no valid sig)";  break;
++            case DKIM_BODY_HASH_MISMATCH:            dkimstatus = "fail (bad bodyhash)";     break;
++            case DKIM_SELECTOR_ALGORITHM_MISMATCH:
++            default:                                 dkimstatus = "neutral (bad format)";    break;
++            }
++            break;
++          }
++        }
++      }
++      if (!dkimstatus) dkimstatus="neutral (unknown)";
++    }
++    DKIMVerifyFree(&dkim);
++    if (dkverify.s[str_chr(dkverify.s, 'A'+dkst)]) die_dk_reject();
++    if (dkverify.s[str_chr(dkverify.s, 'a'+dkst)]) die_dk_defer();
++    if (dkimverify && dkimverify[str_chr(dkimverify, 'A'+abs(dkimst))]) die_dkim_reject();
++    if (dkimverify && dkimverify[str_chr(dkimverify, 'a'+abs(dkimst))]) die_dkim_defer();
++    qmail_puts(&qqt, "Authentication-Results: ");
++    qmail_puts(&qqt, (hostname ? hostname : "localhost"));
++    qmail_puts(&qqt, "; domainkeys=");
++    qmail_puts(&qqt, dkstatus);
++    qmail_puts(&qqt, "; dkim=");
++    qmail_puts(&qqt, dkimstatus);
++    qmail_puts(&qqt, "\n");
++    for (;;) {
++      r = substdio_get(&tempio,&ch,1);
++      if (r == 0) break;
++      if (r == -1) die_read();
++      put(&ch);
++    }
++    close(tempfdr);
++  }
++}
++#endif
++
+ char accept_buf[FMT_ULONG];
+ void acceptmessage(qp) unsigned long qp;
+ {
+@@ -379,7 +622,11 @@
+   out("354 go ahead\r\n");
+  
+   received(&qqt,"SMTP",local,remoteip,remotehost,remoteinfo,fakehelo);
+-  blast(&hops);
++#ifdef DKIM
++  blastdk(&hops);
++#else
++   blast(&hops);
++#endif
+   hops = (hops >= MAXHOPS);
+   if (hops) qmail_fail(&qqt);
+   qmail_from(&qqt,mailfrom.s);
+--- netqmail-1.06.org/str_cpyb.c	1970-01-01 09:00:00.000000000 +0900
++++ netqmail-1.06/str_cpyb.c	2016-04-27 16:42:16.048883519 +0900
+@@ -0,0 +1,18 @@
++#include "str.h"
++
++unsigned int str_copyb(s,t,max)
++register char *s;
++register char *t;
++unsigned int max;
++{
++  register int len;
++
++  len = 0;
++  while (max-- > 0) {
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++    if (!(*s = *t)) return len; ++s; ++t; ++len;
++  }
++  return len;
++}
